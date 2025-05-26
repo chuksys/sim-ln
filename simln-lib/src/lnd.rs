@@ -131,7 +131,7 @@ impl LightningNode for LndNode {
     }
 
     async fn send_payment(
-        &self,
+        &mut self,
         dest: PublicKey,
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError> {
@@ -170,7 +170,7 @@ impl LightningNode for LndNode {
     }
 
     async fn track_payment(
-        &self,
+        &mut self,
         hash: &PaymentHash,
         shutdown: Listener,
     ) -> Result<PaymentResult, LightningError> {

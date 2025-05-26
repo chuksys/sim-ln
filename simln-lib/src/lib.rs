@@ -327,13 +327,13 @@ pub trait LightningNode: Send {
     fn get_network(&self) -> Network;
     /// Keysend payment worth `amount_msat` from a source node to the destination node.
     async fn send_payment(
-        &self,
+        &mut self,
         dest: PublicKey,
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError>;
     /// Track a payment with the specified hash.
     async fn track_payment(
-        &self,
+        &mut self,
         hash: &PaymentHash,
         shutdown: Listener,
     ) -> Result<PaymentResult, LightningError>;
@@ -1149,7 +1149,7 @@ async fn consume_events(
                 if let Some(event) = simulation_event {
                     match event {
                         SimulationEvent::SendPayment(dest, amt_msat) => {
-                            let node = node.lock().await;
+                            let mut node = node.lock().await;
 
                             let mut payment = Payment {
                                 source: node.get_info().pubkey,
@@ -1501,7 +1501,7 @@ async fn track_payment_result(
 ) -> Result<(), SimulationError> {
     log::trace!("Payment result tracker starting.");
 
-    let node = node.lock().await;
+    let mut node = node.lock().await;
 
     let res = match payment.hash {
         Some(hash) => {
