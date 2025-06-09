@@ -22,7 +22,9 @@ use lightning::ln::msgs::{
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::{NetworkGraph, NodeId};
 use lightning::routing::router::{find_route, Path, PaymentParameters, Route, RouteParameters};
-use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters};
+use lightning::routing::scoring::{
+    ProbabilisticScorer, ProbabilisticScoringDecayParameters, ScoreUpdate,
+};
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
 use thiserror::Error;
@@ -731,7 +733,16 @@ impl<T: SimNetwork> LightningNode for SimNode<T> {
 
                     // If we get a payment result back, remove from our in flight set of payments and return the result.
                     res = in_flight.track_payment_receiver => {
-                        res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?
+                        let track_result = res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?;
+                        if let Ok(ref payment_result) = track_result {
+                            let duration = self.clock.now().duration_since(UNIX_EPOCH)?;
+                            if payment_result.payment_outcome == PaymentOutcome::Success {
+                                self.scorer.payment_path_successful(&in_flight.path, duration);
+                            } else if let PaymentOutcome::IndexFailure(index) = payment_result.payment_outcome {
+                                    self.scorer.payment_path_failed(&in_flight.path, index.try_into().unwrap(), duration);
+                            }
+                        }
+                        track_result
                     },
                 }
             },
