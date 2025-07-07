@@ -78,12 +78,12 @@ mock! {
         fn get_info(&self) -> &NodeInfo;
         fn get_network(&self) -> bitcoin::Network;
         async fn send_payment(
-                &self,
+                &mut self,
                 dest: bitcoin::secp256k1::PublicKey,
                 amount_msat: u64,
             ) -> Result<lightning::ln::PaymentHash, LightningError>;
         async fn track_payment(
-                &self,
+                &mut self,
                 hash: &lightning::ln::PaymentHash,
                 shutdown: triggered::Listener,
             ) -> Result<crate::PaymentResult, LightningError>;

@@ -1959,7 +1959,7 @@ mod tests {
 
         // Create a simulated node for the first channel in our network.
         let pk = channels[0].node_1.policy.pubkey;
-        let node = SimNode::new(
+        let mut node = SimNode::new(
             node_info(pk, String::default()),
             sim_network.clone(),
             Arc::new(graph),
