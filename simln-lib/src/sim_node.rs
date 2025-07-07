@@ -10,8 +10,6 @@ use lightning::ln::chan_utils::make_funding_redeemscript;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt::Display;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::task::JoinSet;
@@ -1216,84 +1214,65 @@ impl SimNetwork for SimGraph {
     }
 }
 
-/// This trait defines the "interface" for payment propagation logic
-pub trait PaymentPropagator: Send + Sync + 'static {
-    fn add_htlcs(
-        &self,
-        nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-        source: PublicKey,
-        route: Path,
-        payment_hash: PaymentHash,
-        interceptors: Vec<Arc<dyn Interceptor>>,
-        custom_records: CustomRecords,
-        shutdown_listener: Listener,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError>>
-                + Send,
-        >,
-    >;
+type AddHtlcsResult = Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError>;
+type RemoveHtlcsResult = Result<(), CriticalError>;
 
-    fn remove_htlcs(
-        &self,
-        nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-        resolution_idx: usize,
-        source: PublicKey,
-        route: Path,
-        payment_hash: PaymentHash,
-        success: bool,
-        interceptors: Vec<Arc<dyn Interceptor>>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), CriticalError>> + Send>>;
+pub struct AddHtlcsInnerRequest {
+    pub nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+    pub source: PublicKey,
+    pub route: Path,
+    pub payment_hash: PaymentHash,
+    pub interceptors: Vec<Arc<dyn Interceptor>>,
+    pub custom_records: CustomRecords,
+    pub shutdown_listener: Listener,
+}
+
+pub struct RemoveHtlcsInnerRequest {
+    pub nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+    pub resolution_idx: usize,
+    pub source: PublicKey,
+    pub route: Path,
+    pub payment_hash: PaymentHash,
+    pub success: bool,
+    pub interceptors: Vec<Arc<dyn Interceptor>>,
+}
+
+/// This trait defines the "interface" for payment propagation logic
+#[async_trait]
+pub trait PaymentPropagator: Send + Sync + 'static {
+    async fn add_htlcs(&self, request: AddHtlcsInnerRequest) -> AddHtlcsResult;
+
+    async fn remove_htlcs(&self, request: RemoveHtlcsInnerRequest) -> RemoveHtlcsResult;
 }
 
 pub struct DefaultPaymentPropagator;
 
+#[async_trait]
 impl PaymentPropagator for DefaultPaymentPropagator {
-    fn add_htlcs(
-        &self,
-        nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-        source: PublicKey,
-        route: Path,
-        payment_hash: PaymentHash,
-        interceptors: Vec<Arc<dyn Interceptor>>,
-        custom_records: CustomRecords,
-        shutdown_listener: Listener,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError>>
-                + Send,
-        >,
-    > {
-        Box::pin(add_htlcs(
-            nodes,
-            source,
-            route,
-            payment_hash,
-            interceptors,
-            custom_records,
-            shutdown_listener,
-        ))
+    async fn add_htlcs(&self, request: AddHtlcsInnerRequest) -> AddHtlcsResult {
+        add_htlcs(
+            request.nodes,
+            request.source,
+            request.route,
+            request.payment_hash,
+            request.interceptors,
+            request.custom_records,
+            request.shutdown_listener,
+        )
+        .await
     }
 
-    fn remove_htlcs(
-        &self,
-        nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-        resolution_idx: usize,
-        source: PublicKey,
-        route: Path,
-        payment_hash: PaymentHash,
-        success: bool,
-        interceptors: Vec<Arc<dyn Interceptor>>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), CriticalError>> + Send>> {
-        Box::pin(remove_htlcs(
-            nodes,
-            resolution_idx,
-            source,
-            route,
-            payment_hash,
-            success,
-            interceptors,
-        ))
+    async fn remove_htlcs(&self, request: RemoveHtlcsInnerRequest) -> RemoveHtlcsResult {
+        remove_htlcs(
+            request.nodes,
+            request.resolution_idx,
+            request.source,
+            request.route,
+            request.payment_hash,
+            request.success,
+            request.interceptors,
+        )
+        .await
     }
 }
 
@@ -1530,35 +1509,50 @@ struct PropagatePaymentRequest {
 /// ie a breakdown of our state machine, it will still notify the payment outcome and will use the shutdown trigger
 /// to signal that we should exit.
 async fn propagate_payment(request: PropagatePaymentRequest) {
+    let nodes_for_add = request.nodes.clone();
+    let route_for_add = request.route.clone();
+    let interceptors_for_add = request.interceptors.clone();
+    let custom_records_for_add = request.custom_records.clone();
+    let shutdown_listener_for_add = request.shutdown_signal.1.clone();
+    let shutdown_trigger = request.shutdown_signal.0;
+
+    let sender_for_final_result = request.sender;
+    let source_for_add_and_remove = request.source;
+    let payment_hash_for_add_and_remove = request.payment_hash;
+
     let notify_result = match request
         .propagator
-        .add_htlcs(
-            request.nodes.clone(),
-            request.source,
-            request.route.clone(),
-            request.payment_hash,
-            request.interceptors.clone(),
-            request.custom_records,
-            request.shutdown_signal.1,
-        )
+        .add_htlcs(AddHtlcsInnerRequest {
+            nodes: nodes_for_add,
+            source: source_for_add_and_remove,
+            route: route_for_add,
+            payment_hash: payment_hash_for_add_and_remove,
+            interceptors: interceptors_for_add,
+            custom_records: custom_records_for_add,
+            shutdown_listener: shutdown_listener_for_add,
+        })
         .await
     {
         Ok(Ok(_)) => {
             // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
+            let nodes_for_remove = request.nodes.clone();
+            let route_for_remove = request.route.clone();
+            let interceptors_for_remove = request.interceptors.clone();
+
             if let Err(e) = request
                 .propagator
-                .remove_htlcs(
-                    request.nodes,
-                    request.route.hops.len() - 1,
-                    request.source,
-                    request.route,
-                    request.payment_hash,
-                    true,
-                    request.interceptors,
-                )
+                .remove_htlcs(RemoveHtlcsInnerRequest {
+                    nodes: nodes_for_remove,
+                    resolution_idx: request.route.hops.len() - 1,
+                    source: source_for_add_and_remove,
+                    route: route_for_remove,
+                    payment_hash: payment_hash_for_add_and_remove,
+                    success: true,
+                    interceptors: interceptors_for_remove,
+                })
                 .await
             {
-                request.shutdown_signal.0.trigger();
+                shutdown_trigger.trigger();
                 log::error!("Could not remove htlcs from channel: {e}.");
             }
             PaymentResult {
@@ -1569,22 +1563,26 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         Ok(Err((fail_idx, fwd_err))) => {
             // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
             // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
+            let nodes_for_remove = request.nodes.clone();
+            let route_for_remove = request.route.clone();
+            let interceptors_for_remove = request.interceptors.clone();
+
             if let Some(resolution_idx) = fail_idx {
                 if request
                     .propagator
-                    .remove_htlcs(
-                        request.nodes,
+                    .remove_htlcs(RemoveHtlcsInnerRequest {
+                        nodes: nodes_for_remove,
                         resolution_idx,
-                        request.source,
-                        request.route,
-                        request.payment_hash,
-                        false,
-                        request.interceptors,
-                    )
+                        source: source_for_add_and_remove,
+                        route: route_for_remove,
+                        payment_hash: payment_hash_for_add_and_remove,
+                        success: false,
+                        interceptors: interceptors_for_remove,
+                    })
                     .await
                     .is_err()
                 {
-                    request.shutdown_signal.0.trigger();
+                    shutdown_trigger.trigger();
                 }
             }
 
@@ -1598,7 +1596,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
             }
         },
         Err(critical_err) => {
-            request.shutdown_signal.0.trigger();
+            shutdown_trigger.trigger();
             log::debug!(
                 "Critical error in simulated payment {}: {critical_err}",
                 hex::encode(request.payment_hash.0)
@@ -1610,7 +1608,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         },
     };
 
-    if let Err(e) = request.sender.send(Ok(notify_result)) {
+    if let Err(e) = sender_for_final_result.send(Ok(notify_result)) {
         log::error!("Could not notify payment result: {:?}.", e);
     }
 }
@@ -2135,28 +2133,17 @@ mod tests {
     mock! {
         pub TestPaymentPropagator {}
 
+        #[async_trait]
         impl PaymentPropagator for TestPaymentPropagator {
-            fn add_htlcs(
+            async fn add_htlcs(
                 &self,
-                nodes: Arc<tokio::sync::Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-                source: PublicKey,
-                route: Path,
-                payment_hash: PaymentHash,
-                interceptors: Vec<Arc<dyn Interceptor>>,
-                custom_records: CustomRecords,
-                shutdown_listener: Listener,
-            ) -> Pin<Box<dyn Future<Output = Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError>> + Send>>;
+                request: AddHtlcsInnerRequest
+            ) -> AddHtlcsResult;
 
-            fn remove_htlcs(
+            async fn remove_htlcs(
                 &self,
-                nodes: Arc<tokio::sync::Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-                resolution_idx: usize,
-                source: PublicKey,
-                route: Path,
-                payment_hash: PaymentHash,
-                success: bool,
-                interceptors: Vec<Arc<dyn Interceptor>>,
-            ) -> Pin<Box<dyn Future<Output = Result<(), CriticalError>> + Send>>;
+                request: RemoveHtlcsInnerRequest
+            ) -> RemoveHtlcsResult;
         }
     }
 
@@ -2167,12 +2154,12 @@ mod tests {
         mock_propagator
             .expect_add_htlcs()
             .once()
-            .return_once(|_, _, _, _, _, _, _| Box::pin(async { Ok(Ok(())) }));
+            .return_once(|_| Ok(Ok(())));
 
         mock_propagator
             .expect_remove_htlcs()
             .once()
-            .return_once(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }));
+            .return_once(|_| Ok(()));
 
         let (sender, mut receiver) = oneshot::channel();
         let (trigger, listener) = triggered::trigger();
@@ -2214,25 +2201,13 @@ mod tests {
         mock_propagator
             .expect_add_htlcs()
             .once()
-            .returning(|_, _, _, _, _, _, _| {
-                Box::pin(
-                    async move { Ok(Err((Some(0), ForwardingError::InsufficientBalance(0, 0)))) },
-                )
-            });
+            .returning(|_| Ok(Err((Some(0), ForwardingError::InsufficientBalance(0, 0)))));
 
         mock_propagator
             .expect_remove_htlcs()
             .once()
-            .with(
-                predicate::always(),
-                predicate::eq(0),
-                predicate::always(),
-                predicate::always(),
-                predicate::always(),
-                predicate::eq(false),
-                predicate::always(),
-            )
-            .returning(|_, _, _, _, _, _, _| Box::pin(async move { Ok(()) }));
+            .with(predicate::always())
+            .returning(|_| Ok(()));
 
         let (sender, mut receiver) = oneshot::channel();
 
