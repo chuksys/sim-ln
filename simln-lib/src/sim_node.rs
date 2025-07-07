@@ -10,6 +10,8 @@ use lightning::ln::chan_utils::make_funding_redeemscript;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt::Display;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::task::JoinSet;
@@ -1180,6 +1182,8 @@ impl SimNetwork for SimGraph {
             },
         };
 
+        let default_propagator = DefaultPaymentPropagator;
+
         self.tasks.spawn(propagate_payment(PropagatePaymentRequest {
             nodes: Arc::clone(&self.channels),
             source,
@@ -1189,6 +1193,7 @@ impl SimNetwork for SimGraph {
             interceptors: self.interceptors.clone(),
             custom_records: custom_records.unwrap_or(self.default_custom_records.clone()),
             shutdown_signal: self.shutdown_signal.clone(),
+            propagator: Arc::new(default_propagator) as Arc<dyn PaymentPropagator>,
         }));
     }
 
@@ -1208,6 +1213,77 @@ impl SimNetwork for SimGraph {
             nodes.push(node.1 .0.clone());
         }
         nodes
+    }
+}
+
+/// This trait defines the "interface" for payment propagation logic
+pub trait PaymentPropagator: Send + Sync + 'static {
+    fn add_htlcs(
+        &self,
+        nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+        source: PublicKey,
+        route: Path,
+        payment_hash: PaymentHash,
+        interceptors: Vec<Arc<dyn Interceptor>>,
+        custom_records: CustomRecords,
+        shutdown_listener: Listener,
+    ) -> Pin<Box<dyn Future<Output = Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError>> + Send>>;
+
+    fn remove_htlcs(
+        &self,
+        nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+        resolution_idx: usize,
+        source: PublicKey,
+        route: Path,
+        payment_hash: PaymentHash,
+        success: bool,
+        interceptors: Vec<Arc<dyn Interceptor>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CriticalError>> + Send>>;
+}
+
+pub struct DefaultPaymentPropagator;
+
+impl PaymentPropagator for DefaultPaymentPropagator {
+    fn add_htlcs(
+        &self,
+        nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+        source: PublicKey,
+        route: Path,
+        payment_hash: PaymentHash,
+        interceptors: Vec<Arc<dyn Interceptor>>,
+        custom_records: CustomRecords,
+        shutdown_listener: Listener,
+    ) -> Pin<Box<dyn Future<Output = Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError>> + Send>> {
+        Box::pin(add_htlcs(
+            nodes,
+            source,
+            route,
+            payment_hash,
+            interceptors,
+            custom_records,
+            shutdown_listener,
+        ))
+    }
+
+    fn remove_htlcs(
+        &self,
+        nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+        resolution_idx: usize,
+        source: PublicKey,
+        route: Path,
+        payment_hash: PaymentHash,
+        success: bool,
+        interceptors: Vec<Arc<dyn Interceptor>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CriticalError>> + Send>> {
+        Box::pin(remove_htlcs(
+            nodes,
+            resolution_idx,
+            source,
+            route,
+            payment_hash,
+            success,
+            interceptors,
+        ))
     }
 }
 
@@ -1436,6 +1512,7 @@ struct PropagatePaymentRequest {
     interceptors: Vec<Arc<dyn Interceptor>>,
     custom_records: CustomRecords,
     shutdown_signal: (Trigger, Listener),
+    propagator: Arc<dyn PaymentPropagator>,
 }
 
 /// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
@@ -1443,7 +1520,7 @@ struct PropagatePaymentRequest {
 /// ie a breakdown of our state machine, it will still notify the payment outcome and will use the shutdown trigger
 /// to signal that we should exit.
 async fn propagate_payment(request: PropagatePaymentRequest) {
-    let notify_result = match add_htlcs(
+    let notify_result = match request.propagator.add_htlcs(
         request.nodes.clone(),
         request.source,
         request.route.clone(),
@@ -1456,7 +1533,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
     {
         Ok(Ok(_)) => {
             // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
-            if let Err(e) = remove_htlcs(
+            if let Err(e) = request.propagator.remove_htlcs(
                 request.nodes,
                 request.route.hops.len() - 1,
                 request.source,
@@ -1479,7 +1556,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
             // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
             // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
             if let Some(resolution_idx) = fail_idx {
-                if remove_htlcs(
+                if request.propagator.remove_htlcs(
                     request.nodes,
                     resolution_idx,
                     request.source,
@@ -1561,8 +1638,8 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::test_utils::get_random_keypair;
     use lightning::routing::router::build_route_from_hops;
-    use lightning::routing::router::Route;
-    use mockall::mock;
+    use lightning::routing::router::{Route, RouteHop};
+    use mockall::{mock, predicate};
     use ntest::assert_true;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -2036,6 +2113,148 @@ mod tests {
             result_2.payment_outcome,
             PaymentOutcome::InsufficientBalance
         ));
+    }
+
+    // Mock the PaymentPropagator trait
+    mock! {
+        pub TestPaymentPropagator {}
+
+        impl PaymentPropagator for TestPaymentPropagator {
+            fn add_htlcs(
+                &self,
+                nodes: Arc<tokio::sync::Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+                source: PublicKey,
+                route: Path,
+                payment_hash: PaymentHash,
+                interceptors: Vec<Arc<dyn Interceptor>>,
+                custom_records: CustomRecords,
+                shutdown_listener: Listener,
+            ) -> Pin<Box<dyn Future<Output = Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError>> + Send>>;
+
+            fn remove_htlcs(
+                &self,
+                nodes: Arc<tokio::sync::Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
+                resolution_idx: usize,
+                source: PublicKey,
+                route: Path,
+                payment_hash: PaymentHash,
+                success: bool,
+                interceptors: Vec<Arc<dyn Interceptor>>,
+            ) -> Pin<Box<dyn Future<Output = Result<(), CriticalError>> + Send>>;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_propagate_payment_success() {
+        let mut mock_propagator = MockTestPaymentPropagator::new();
+      
+        mock_propagator.expect_add_htlcs()
+            .once()
+            .return_once(|_, _, _, _, _, _, _| Box::pin(async { Ok(Ok(())) }));
+
+        mock_propagator.expect_remove_htlcs()
+            .once()
+            .return_once(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }));
+
+        let (sender, mut receiver) = oneshot::channel();
+        let (trigger, listener) = triggered::trigger();
+
+        let request = PropagatePaymentRequest {
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            source: get_random_keypair().1,
+            route: Path { hops: vec![
+                RouteHop {
+                    pubkey: get_random_keypair().1,
+                    node_features: NodeFeatures::empty(),
+                    short_channel_id: 1,
+                    channel_features: ChannelFeatures::empty(),
+                    fee_msat: 10,
+                    cltv_expiry_delta: 20,
+                    maybe_announced_channel: true,
+                }
+            ], blinded_tail: None },
+            payment_hash: PaymentHash([0; 32]),
+            sender,
+            interceptors: vec![],
+            custom_records: CustomRecords::new(),
+            shutdown_signal: (trigger, listener),
+            propagator: Arc::new(mock_propagator),
+        };
+
+        propagate_payment(request).await;
+
+        let result = receiver.try_recv().unwrap().unwrap();
+        assert_eq!(result.payment_outcome, PaymentOutcome::Success);
+        assert_eq!(result.htlc_count, 1);
+    }
+
+    #[tokio::test]
+    async fn propagate_payment_index_failure_on_add_htlcs_returns_some_0() {
+        let mut mock_propagator = MockTestPaymentPropagator::new();
+
+        mock_propagator.expect_add_htlcs()
+            .once()
+            .returning(|_, _, _, _, _, _, _| {
+                Box::pin(async move {
+                    Ok(Err((Some(0), ForwardingError::InsufficientBalance(0, 0))))
+                })
+        });
+
+        mock_propagator.expect_remove_htlcs()
+        .once()
+        .with(
+            predicate::always(),
+            predicate::eq(0),
+            predicate::always(),
+            predicate::always(),
+            predicate::always(),
+            predicate::eq(false),
+            predicate::always(),
+        )
+        .returning(|_, _, _, _, _, _, _| {
+            Box::pin(async move {
+                Ok(())
+            })
+        });
+
+        let (sender, mut receiver) = oneshot::channel();
+
+        let (shutdown_trigger, shutdown_listener) = triggered::trigger();
+        let request = PropagatePaymentRequest {
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            source: get_random_keypair().1,
+            route: Path { hops: vec![
+                    RouteHop {
+                        pubkey: get_random_keypair().1,
+                        node_features: NodeFeatures::empty(),
+                        short_channel_id: 1,
+                        channel_features: ChannelFeatures::empty(),
+                        fee_msat: 10,
+                        cltv_expiry_delta: 20,
+                        maybe_announced_channel: true,
+                    }
+            ], blinded_tail: None },
+            payment_hash: PaymentHash([0; 32]),
+            sender,
+            interceptors: vec![],
+            custom_records: CustomRecords::new(),
+            shutdown_signal: (shutdown_trigger, shutdown_listener),
+            propagator: Arc::new(mock_propagator),
+        };
+
+        propagate_payment(request).await;
+
+        let payment_result = receiver.try_recv().expect("Expected a payment result");
+
+        match payment_result {
+            Ok(result) => {
+                assert_eq!(result.htlc_count, 0);
+                assert_eq!(result.payment_outcome, PaymentOutcome::IndexFailure(0));
+            },
+            Err(e) => {
+                panic!("Expected Ok(PaymentResult), but got Err: {:?}", e);
+            },
+        }
     }
 
     mock! {
