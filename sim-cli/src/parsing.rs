@@ -3,7 +3,7 @@ use bitcoin::secp256k1::PublicKey;
 use clap::{builder::TypedValueParser, Parser};
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
-use simln_lib::clock::SimulationClock;
+use simln_lib::clock::{SimulationClock, SystemClock};
 use simln_lib::sim_node::{
     ln_node_from_graph, populate_network_graph, ChannelPolicy, CustomRecords, Interceptor,
     SimGraph, SimNode, SimulatedChannel,
@@ -262,7 +262,7 @@ pub async fn create_simulation_with_network(
     (
         Simulation<SimulationClock>,
         Vec<ActivityDefinition>,
-        HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph>>>>,
+        HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph, SystemClock>>>>,
     ),
     anyhow::Error,
 > {

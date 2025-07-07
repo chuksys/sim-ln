@@ -1,4 +1,4 @@
-use crate::clock::{Clock, SimulationClock};
+use crate::clock::{Clock, SystemClock};
 use crate::{
     Graph, LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult, SimulationError,
 };
@@ -502,7 +502,7 @@ struct InFlightPayment {
 /// all functionality through to a coordinating simulation network. This implementation contains both the [`SimNetwork`]
 /// implementation that will allow us to dispatch payments and a read-only NetworkGraph that is used for pathfinding.
 /// While these two could be combined, we re-use the LDK-native struct to allow re-use of their pathfinding logic.
-pub struct SimNode<T: SimNetwork> {
+pub struct SimNode<T: SimNetwork, C: Clock> {
     info: NodeInfo,
     /// The underlying execution network that will be responsible for dispatching payments.
     network: Arc<Mutex<T>>,
@@ -514,16 +514,17 @@ pub struct SimNode<T: SimNetwork> {
     /// multiple payments to maintain scoring state.
     scorer: ProbabilisticScorer<Arc<LdkNetworkGraph>, Arc<WrappedLog>>,
     /// Clock for tracking simulation time.
-    clock: SimulationClock,
+    clock: C,
 }
 
-impl<T: SimNetwork> SimNode<T> {
+impl<T: SimNetwork, C: Clock> SimNode<T, C> {
     /// Creates a new simulation node that refers to the high level network coordinator provided to process payments
     /// on its behalf. The pathfinding graph is provided separately so that each node can handle its own pathfinding.
     pub fn new(
         info: NodeInfo,
         payment_network: Arc<Mutex<T>>,
         pathfinding_graph: Arc<LdkNetworkGraph>,
+        clock: C,
     ) -> Result<Self, LightningError> {
         // Initialize the probabilistic scorer with default parameters for learning from payment
         // history. These parameters control how much successful/failed payments affect routing
@@ -533,16 +534,6 @@ impl<T: SimNetwork> SimNode<T> {
             pathfinding_graph.clone(),
             Arc::new(WrappedLog {}),
         );
-
-        let clock = match SimulationClock::new(1) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(LightningError::SendPaymentError(format!(
-                    "Error creating simulation clock: {}",
-                    e
-                )));
-            },
-        };
 
         Ok(SimNode {
             info,
@@ -640,7 +631,7 @@ fn find_payment_route(
 }
 
 #[async_trait]
-impl<T: SimNetwork> LightningNode for SimNode<T> {
+impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
     fn get_info(&self) -> &NodeInfo {
         &self.info
     }
@@ -1057,8 +1048,8 @@ impl SimGraph {
 pub async fn ln_node_from_graph(
     graph: Arc<Mutex<SimGraph>>,
     routing_graph: Arc<LdkNetworkGraph>,
-) -> Result<HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph>>>>, LightningError> {
-    let mut nodes: HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph>>>> = HashMap::new();
+) -> Result<HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph, SystemClock>>>>, LightningError> {
+    let mut nodes: HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph, SystemClock>>>> = HashMap::new();
 
     for node in graph.lock().await.nodes.iter() {
         nodes.insert(
@@ -1067,6 +1058,7 @@ pub async fn ln_node_from_graph(
                 node.1 .0.clone(),
                 graph.clone(),
                 routing_graph.clone(),
+                SystemClock {}
             )?)),
         );
     }
@@ -1952,6 +1944,7 @@ mod tests {
             node_info(pk, String::default()),
             sim_network.clone(),
             Arc::new(graph),
+            SystemClock {}
         )
         .unwrap();
 
@@ -2347,6 +2340,7 @@ mod tests {
             node_info(test_kit.nodes[0], String::default()),
             Arc::new(Mutex::new(test_kit.graph)),
             test_kit.routing_graph.clone(),
+            SystemClock {}
         )
         .unwrap();
 
