@@ -507,7 +507,7 @@ pub struct SimNode<T: SimNetwork, C: Clock> {
     /// The underlying execution network that will be responsible for dispatching payments.
     network: Arc<Mutex<T>>,
     /// Tracks the channel that will provide updates for payments by hash.
-    in_flight: HashMap<PaymentHash, InFlightPayment>,
+    in_flight: Mutex<HashMap<PaymentHash, InFlightPayment>>,
     /// A read-only graph used for pathfinding.
     pathfinding_graph: Arc<LdkNetworkGraph>,
     /// Probabilistic scorer used to rank paths through the network for routing. This is reused across
@@ -538,7 +538,7 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
         Ok(SimNode {
             info,
             network: payment_network,
-            in_flight: HashMap::new(),
+            in_flight: Mutex::new(HashMap::new()),
             pathfinding_graph,
             scorer,
             clock,
@@ -569,7 +569,7 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
         }
 
         // Check for payment hash collision, failing the payment if we happen to repeat one.
-        match self.in_flight.entry(payment_hash) {
+        match self.in_flight.lock().await.entry(payment_hash) {
             Entry::Occupied(_) => {
                 return Err(LightningError::SendPaymentError(
                     "payment hash exists".to_string(),
@@ -651,7 +651,7 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
     /// send_payment picks a random preimage for a payment, dispatches it in the network and adds a tracking channel
     /// to our node state to be used for subsequent track_payment calls.
     async fn send_payment(
-        &mut self,
+        &self,
         dest: PublicKey,
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError> {
@@ -662,7 +662,8 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
         let payment_hash = preimage.into();
 
         // Check for payment hash collision, failing the payment if we happen to repeat one.
-        let entry = match self.in_flight.entry(payment_hash) {
+        let mut in_flight_guard = self.in_flight.lock().await;
+        let entry = match in_flight_guard.entry(payment_hash) {
             Entry::Occupied(_) => {
                 return Err(LightningError::SendPaymentError(
                     "payment hash exists".to_string(),
@@ -724,11 +725,11 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
     /// provided is triggered. This call will fail if the hash provided was not obtained from send_payment or passed
     /// into send_to_route first.
     async fn track_payment(
-        &mut self,
+        &self,
         hash: &PaymentHash,
         listener: Listener,
     ) -> Result<PaymentResult, LightningError> {
-        match self.in_flight.remove(hash) {
+        match self.in_flight.lock().await.remove(hash) {
             Some(in_flight) => {
                 select! {
                     biased;
@@ -2050,7 +2051,7 @@ mod tests {
 
         // Create a simulated node for the first channel in our network.
         let pk = channels[0].node_1.policy.pubkey;
-        let mut node = SimNode::new(
+        let node = SimNode::new(
             node_info(pk, String::default()),
             sim_network.clone(),
             Arc::new(graph),

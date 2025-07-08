@@ -133,7 +133,7 @@ impl LightningNode for EclairNode {
     }
 
     async fn send_payment(
-        &mut self,
+        &self,
         dest: PublicKey,
         amount_msat: u64,
     ) -> Result<PaymentHash, LightningError> {
@@ -164,7 +164,7 @@ impl LightningNode for EclairNode {
     }
 
     async fn track_payment(
-        &mut self,
+        &self,
         hash: &PaymentHash,
         shutdown: Listener,
     ) -> Result<PaymentResult, LightningError> {
