@@ -512,7 +512,7 @@ pub struct SimNode<T: SimNetwork, C: Clock> {
     pathfinding_graph: Arc<LdkNetworkGraph>,
     /// Probabilistic scorer used to rank paths through the network for routing. This is reused across
     /// multiple payments to maintain scoring state.
-    scorer: ProbabilisticScorer<Arc<LdkNetworkGraph>, Arc<WrappedLog>>,
+    scorer: Mutex<ProbabilisticScorer<Arc<LdkNetworkGraph>, Arc<WrappedLog>>>,
     /// Clock for tracking simulation time.
     clock: C,
 }
@@ -540,7 +540,7 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
             network: payment_network,
             in_flight: Mutex::new(HashMap::new()),
             pathfinding_graph,
-            scorer,
+            scorer: Mutex::new(scorer),
             clock,
         })
     }
@@ -673,12 +673,13 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
         };
 
         // Use the stored scorer when finding a route
+        let scorer_guard = self.scorer.lock().await;
         let route = match find_payment_route(
             &self.info.pubkey,
             dest,
             amount_msat,
             &self.pathfinding_graph,
-            &self.scorer,
+            &scorer_guard,
         ) {
             Ok(path) => path,
             // In the case that we can't find a route for the payment, we still report a successful payment *api call*
@@ -743,9 +744,9 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
                         if let Ok(ref payment_result) = track_result {
                             let duration = self.clock.now().duration_since(UNIX_EPOCH)?;
                             if payment_result.payment_outcome == PaymentOutcome::Success {
-                                self.scorer.payment_path_successful(&in_flight.path, duration);
+                                self.scorer.lock().await.payment_path_successful(&in_flight.path, duration);
                             } else if let PaymentOutcome::IndexFailure(index) = payment_result.payment_outcome {
-                                    self.scorer.payment_path_failed(&in_flight.path, index.try_into().unwrap(), duration);
+                                    self.scorer.lock().await.payment_path_failed(&in_flight.path, index.try_into().unwrap(), duration);
                             }
                         }
                         track_result
