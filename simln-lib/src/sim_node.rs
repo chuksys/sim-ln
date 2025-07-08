@@ -1,4 +1,4 @@
-use crate::clock::{Clock, SystemClock};
+use crate::clock::Clock;
 use crate::{
     Graph, LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult, SimulationError,
 };
@@ -1061,11 +1061,12 @@ impl SimGraph {
 }
 
 /// Produces a map of node public key to lightning node implementation to be used for simulations.
-pub async fn ln_node_from_graph(
+pub async fn ln_node_from_graph<C: Clock + std::marker::Copy>(
     graph: Arc<Mutex<SimGraph>>,
     routing_graph: Arc<LdkNetworkGraph>,
-) -> Result<HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph, SystemClock>>>>, LightningError> {
-    let mut nodes: HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph, SystemClock>>>> = HashMap::new();
+    clock: C,
+) -> Result<HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph, C>>>>, LightningError> {
+    let mut nodes: HashMap<PublicKey, Arc<Mutex<SimNode<SimGraph, C>>>> = HashMap::new();
 
     for node in graph.lock().await.nodes.iter() {
         nodes.insert(
@@ -1074,7 +1075,7 @@ pub async fn ln_node_from_graph(
                 node.1 .0.clone(),
                 graph.clone(),
                 routing_graph.clone(),
-                SystemClock {},
+                clock.clone(),
             )?)),
         );
     }

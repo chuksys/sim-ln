@@ -12,7 +12,7 @@ pub trait Clock: Send + Sync {
 }
 
 /// Provides a wall clock implementation of the Clock trait.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct SystemClock {}
 
 #[async_trait]
