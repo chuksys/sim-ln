@@ -1075,7 +1075,7 @@ pub async fn ln_node_from_graph<C: Clock + std::marker::Copy>(
                 node.1 .0.clone(),
                 graph.clone(),
                 routing_graph.clone(),
-                clock.clone(),
+                clock,
             )?)),
         );
     }
