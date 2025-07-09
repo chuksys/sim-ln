@@ -1183,8 +1183,6 @@ impl SimNetwork for SimGraph {
             },
         };
 
-        let default_propagator = DefaultPaymentPropagator;
-
         self.tasks.spawn(propagate_payment(PropagatePaymentRequest {
             nodes: Arc::clone(&self.channels),
             source,
@@ -1194,7 +1192,6 @@ impl SimNetwork for SimGraph {
             interceptors: self.interceptors.clone(),
             custom_records: custom_records.unwrap_or(self.default_custom_records.clone()),
             shutdown_signal: self.shutdown_signal.clone(),
-            propagator: Arc::new(default_propagator) as Arc<dyn PaymentPropagator>,
         }));
     }
 
@@ -1214,68 +1211,6 @@ impl SimNetwork for SimGraph {
             nodes.push(node.1 .0.clone());
         }
         nodes
-    }
-}
-
-type AddHtlcsResult = Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError>;
-type RemoveHtlcsResult = Result<(), CriticalError>;
-
-pub struct AddHtlcsInnerRequest {
-    pub nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-    pub source: PublicKey,
-    pub route: Path,
-    pub payment_hash: PaymentHash,
-    pub interceptors: Vec<Arc<dyn Interceptor>>,
-    pub custom_records: CustomRecords,
-    pub shutdown_listener: Listener,
-}
-
-pub struct RemoveHtlcsInnerRequest {
-    pub nodes: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
-    pub resolution_idx: usize,
-    pub source: PublicKey,
-    pub route: Path,
-    pub payment_hash: PaymentHash,
-    pub success: bool,
-    pub interceptors: Vec<Arc<dyn Interceptor>>,
-}
-
-/// This trait defines the "interface" for payment propagation logic
-#[async_trait]
-pub trait PaymentPropagator: Send + Sync + 'static {
-    async fn add_htlcs(&self, request: AddHtlcsInnerRequest) -> AddHtlcsResult;
-
-    async fn remove_htlcs(&self, request: RemoveHtlcsInnerRequest) -> RemoveHtlcsResult;
-}
-
-pub struct DefaultPaymentPropagator;
-
-#[async_trait]
-impl PaymentPropagator for DefaultPaymentPropagator {
-    async fn add_htlcs(&self, request: AddHtlcsInnerRequest) -> AddHtlcsResult {
-        add_htlcs(
-            request.nodes,
-            request.source,
-            request.route,
-            request.payment_hash,
-            request.interceptors,
-            request.custom_records,
-            request.shutdown_listener,
-        )
-        .await
-    }
-
-    async fn remove_htlcs(&self, request: RemoveHtlcsInnerRequest) -> RemoveHtlcsResult {
-        remove_htlcs(
-            request.nodes,
-            request.resolution_idx,
-            request.source,
-            request.route,
-            request.payment_hash,
-            request.success,
-            request.interceptors,
-        )
-        .await
     }
 }
 
@@ -1504,7 +1439,6 @@ struct PropagatePaymentRequest {
     interceptors: Vec<Arc<dyn Interceptor>>,
     custom_records: CustomRecords,
     shutdown_signal: (Trigger, Listener),
-    propagator: Arc<dyn PaymentPropagator>,
 }
 
 /// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
@@ -1512,50 +1446,31 @@ struct PropagatePaymentRequest {
 /// ie a breakdown of our state machine, it will still notify the payment outcome and will use the shutdown trigger
 /// to signal that we should exit.
 async fn propagate_payment(request: PropagatePaymentRequest) {
-    let nodes_for_add = request.nodes.clone();
-    let route_for_add = request.route.clone();
-    let interceptors_for_add = request.interceptors.clone();
-    let custom_records_for_add = request.custom_records.clone();
-    let shutdown_listener_for_add = request.shutdown_signal.1.clone();
-    let shutdown_trigger = request.shutdown_signal.0;
-
-    let sender_for_final_result = request.sender;
-    let source_for_add_and_remove = request.source;
-    let payment_hash_for_add_and_remove = request.payment_hash;
-
-    let notify_result = match request
-        .propagator
-        .add_htlcs(AddHtlcsInnerRequest {
-            nodes: nodes_for_add,
-            source: source_for_add_and_remove,
-            route: route_for_add,
-            payment_hash: payment_hash_for_add_and_remove,
-            interceptors: interceptors_for_add,
-            custom_records: custom_records_for_add,
-            shutdown_listener: shutdown_listener_for_add,
-        })
-        .await
+    let notify_result = match add_htlcs(
+        request.nodes.clone(),
+        request.source,
+        request.route.clone(),
+        request.payment_hash,
+        request.interceptors.clone(),
+        request.custom_records,
+        request.shutdown_signal.1,
+    )
+    .await
     {
         Ok(Ok(_)) => {
             // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
-            let nodes_for_remove = request.nodes.clone();
-            let route_for_remove = request.route.clone();
-            let interceptors_for_remove = request.interceptors.clone();
-
-            if let Err(e) = request
-                .propagator
-                .remove_htlcs(RemoveHtlcsInnerRequest {
-                    nodes: nodes_for_remove,
-                    resolution_idx: request.route.hops.len() - 1,
-                    source: source_for_add_and_remove,
-                    route: route_for_remove,
-                    payment_hash: payment_hash_for_add_and_remove,
-                    success: true,
-                    interceptors: interceptors_for_remove,
-                })
-                .await
+            if let Err(e) = remove_htlcs(
+                request.nodes,
+                request.route.hops.len() - 1,
+                request.source,
+                request.route,
+                request.payment_hash,
+                true,
+                request.interceptors,
+            )
+            .await
             {
-                shutdown_trigger.trigger();
+                request.shutdown_signal.0.trigger();
                 log::error!("Could not remove htlcs from channel: {e}.");
             }
             PaymentResult {
@@ -1566,26 +1481,20 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         Ok(Err((fail_idx, fwd_err))) => {
             // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
             // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
-            let nodes_for_remove = request.nodes.clone();
-            let route_for_remove = request.route.clone();
-            let interceptors_for_remove = request.interceptors.clone();
-
             if let Some(resolution_idx) = fail_idx {
-                if request
-                    .propagator
-                    .remove_htlcs(RemoveHtlcsInnerRequest {
-                        nodes: nodes_for_remove,
-                        resolution_idx,
-                        source: source_for_add_and_remove,
-                        route: route_for_remove,
-                        payment_hash: payment_hash_for_add_and_remove,
-                        success: false,
-                        interceptors: interceptors_for_remove,
-                    })
-                    .await
-                    .is_err()
+                if remove_htlcs(
+                    request.nodes,
+                    resolution_idx,
+                    request.source,
+                    request.route,
+                    request.payment_hash,
+                    false,
+                    request.interceptors,
+                )
+                .await
+                .is_err()
                 {
-                    shutdown_trigger.trigger();
+                    request.shutdown_signal.0.trigger();
                 }
             }
 
@@ -1599,7 +1508,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
             }
         },
         Err(critical_err) => {
-            shutdown_trigger.trigger();
+            request.shutdown_signal.0.trigger();
             log::debug!(
                 "Critical error in simulated payment {}: {critical_err}",
                 hex::encode(request.payment_hash.0)
@@ -1611,7 +1520,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
         },
     };
 
-    if let Err(e) = sender_for_final_result.send(Ok(notify_result)) {
+    if let Err(e) = request.sender.send(Ok(notify_result)) {
         log::error!("Could not notify payment result: {:?}.", e);
     }
 }
@@ -1655,8 +1564,8 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::test_utils::get_random_keypair;
     use lightning::routing::router::build_route_from_hops;
-    use lightning::routing::router::{Route, RouteHop};
-    use mockall::{mock, predicate};
+    use lightning::routing::router::Route;
+    use mockall::mock;
     use ntest::assert_true;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -2132,127 +2041,6 @@ mod tests {
         ));
     }
 
-    // Mock the PaymentPropagator trait
-    mock! {
-        pub TestPaymentPropagator {}
-
-        #[async_trait]
-        impl PaymentPropagator for TestPaymentPropagator {
-            async fn add_htlcs(
-                &self,
-                request: AddHtlcsInnerRequest
-            ) -> AddHtlcsResult;
-
-            async fn remove_htlcs(
-                &self,
-                request: RemoveHtlcsInnerRequest
-            ) -> RemoveHtlcsResult;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_propagate_payment_success() {
-        let mut mock_propagator = MockTestPaymentPropagator::new();
-
-        mock_propagator
-            .expect_add_htlcs()
-            .once()
-            .return_once(|_| Ok(Ok(())));
-
-        mock_propagator
-            .expect_remove_htlcs()
-            .once()
-            .return_once(|_| Ok(()));
-
-        let (sender, mut receiver) = oneshot::channel();
-        let (trigger, listener) = triggered::trigger();
-
-        let request = PropagatePaymentRequest {
-            nodes: Arc::new(Mutex::new(HashMap::new())),
-            source: get_random_keypair().1,
-            route: Path {
-                hops: vec![RouteHop {
-                    pubkey: get_random_keypair().1,
-                    node_features: NodeFeatures::empty(),
-                    short_channel_id: 1,
-                    channel_features: ChannelFeatures::empty(),
-                    fee_msat: 10,
-                    cltv_expiry_delta: 20,
-                    maybe_announced_channel: true,
-                }],
-                blinded_tail: None,
-            },
-            payment_hash: PaymentHash([0; 32]),
-            sender,
-            interceptors: vec![],
-            custom_records: CustomRecords::new(),
-            shutdown_signal: (trigger, listener),
-            propagator: Arc::new(mock_propagator),
-        };
-
-        propagate_payment(request).await;
-
-        let result = receiver.try_recv().unwrap().unwrap();
-        assert_eq!(result.payment_outcome, PaymentOutcome::Success);
-        assert_eq!(result.htlc_count, 1);
-    }
-
-    #[tokio::test]
-    async fn propagate_payment_index_failure_on_add_htlcs_returns_some_0() {
-        let mut mock_propagator = MockTestPaymentPropagator::new();
-
-        mock_propagator
-            .expect_add_htlcs()
-            .once()
-            .returning(|_| Ok(Err((Some(0), ForwardingError::InsufficientBalance(0, 0)))));
-
-        mock_propagator
-            .expect_remove_htlcs()
-            .once()
-            .with(predicate::always())
-            .returning(|_| Ok(()));
-
-        let (sender, mut receiver) = oneshot::channel();
-
-        let (shutdown_trigger, shutdown_listener) = triggered::trigger();
-        let request = PropagatePaymentRequest {
-            nodes: Arc::new(Mutex::new(HashMap::new())),
-            source: get_random_keypair().1,
-            route: Path {
-                hops: vec![RouteHop {
-                    pubkey: get_random_keypair().1,
-                    node_features: NodeFeatures::empty(),
-                    short_channel_id: 1,
-                    channel_features: ChannelFeatures::empty(),
-                    fee_msat: 10,
-                    cltv_expiry_delta: 20,
-                    maybe_announced_channel: true,
-                }],
-                blinded_tail: None,
-            },
-            payment_hash: PaymentHash([0; 32]),
-            sender,
-            interceptors: vec![],
-            custom_records: CustomRecords::new(),
-            shutdown_signal: (shutdown_trigger, shutdown_listener),
-            propagator: Arc::new(mock_propagator),
-        };
-
-        propagate_payment(request).await;
-
-        let payment_result = receiver.try_recv().expect("Expected a payment result");
-
-        match payment_result {
-            Ok(result) => {
-                assert_eq!(result.htlc_count, 0);
-                assert_eq!(result.payment_outcome, PaymentOutcome::IndexFailure(0));
-            },
-            Err(e) => {
-                panic!("Expected Ok(PaymentResult), but got Err: {:?}", e);
-            },
-        }
-    }
-
     mock! {
         #[derive(Debug)]
         TestInterceptor{}
@@ -2562,6 +2350,63 @@ mod tests {
         test_kit.shutdown.0.trigger();
         test_kit.graph.tasks.close();
         test_kit.graph.tasks.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_payment_fails_on_first_hop_and_returns_some_0() {
+        let chan_capacity = 500_000_000;
+        let test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, vec![], CustomRecords::default()).await;
+
+        let mut node = SimNode::new(
+            node_info(test_kit.nodes[0], String::default()),
+            Arc::new(Mutex::new(test_kit.graph)),
+            test_kit.routing_graph.clone(),
+            SystemClock {},
+        )
+        .unwrap();
+
+        let mut route = build_route_from_hops(
+            &test_kit.nodes[0],
+            &[test_kit.nodes[1], test_kit.nodes[2], test_kit.nodes[3]],
+            &RouteParameters {
+                payment_params: PaymentParameters::from_node_id(*test_kit.nodes.last().unwrap(), 0)
+                    .with_max_total_cltv_expiry_delta(u32::MAX)
+                    .with_max_path_count(1)
+                    .with_max_channel_saturation_power_of_half(1),
+                final_value_msat: 20_000,
+                max_total_routing_fee_msat: None,
+            },
+            &test_kit.routing_graph,
+            &WrappedLog {},
+            &[0; 32],
+        )
+        .unwrap();
+
+        // Alter route to make payment fail on first hop (Index 0).
+        route.paths[0].hops[0].cltv_expiry_delta = 39;
+
+        let preimage = PaymentPreimage(rand::random());
+        let payment_hash = preimage.into();
+        let send_result = node.send_to_route(route, payment_hash, None).await;
+
+        assert!(send_result.is_ok());
+
+        let (_, shutdown_listener) = triggered::trigger();
+        let result = node
+            .track_payment(&payment_hash, shutdown_listener)
+            .await
+            .unwrap();
+
+        match result.payment_outcome {
+            PaymentOutcome::IndexFailure(_) => {
+                assert_eq!(result.payment_outcome, PaymentOutcome::IndexFailure(0));
+            },
+            _ => panic!(
+                "Expected IndexFailure, but got: {:?}",
+                result.payment_outcome
+            ),
+        }
     }
 
     #[tokio::test]
